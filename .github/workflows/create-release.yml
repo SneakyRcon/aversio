@@ -1,0 +1,124 @@
+name: Create Aversio Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      bootstrap_version:
+        description: First release only; use 1.0.0 before the self-extension is published
+        required: false
+        type: string
+
+permissions:
+  actions: write
+  contents: write
+
+concurrency:
+  group: create-aversio-release
+  cancel-in-progress: false
+
+jobs:
+  verify-and-calculate:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Select Temurin 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+          cache: maven
+
+      - name: Verify build
+        env:
+          BOOTSTRAP_VERSION: ${{ inputs.bootstrap_version }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$BOOTSTRAP_VERSION" ]]; then
+            mvn -B --no-transfer-progress \
+              -Dversioning.disable=true \
+              -Drevision="$BOOTSTRAP_VERSION" \
+              clean verify
+          else
+            if [[ "$TAG_NAME" != v* ]]; then
+              echo "A non-bootstrap release must run for a vX.Y.Z tag" >&2
+              exit 1
+            fi
+            mvn -B --no-transfer-progress \
+              -Dversioning.disable=true \
+              -Drevision="${TAG_NAME#v}" \
+              clean verify
+          fi
+
+      - name: Calculate and validate release version
+        id: version
+        env:
+          BOOTSTRAP_VERSION: ${{ inputs.bootstrap_version }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "$BOOTSTRAP_VERSION" ]]; then
+            version="$BOOTSTRAP_VERSION"
+          else
+            expected="${TAG_NAME#v}"
+            version="$(mvn -q -Dversioning.disable=true -Drevision="$expected" \
+              -DforceStdout help:evaluate -Dexpression=project.version)"
+            if [[ "$TAG_NAME" != v* || "$version" != "$expected" ]]; then
+              echo "Tag $TAG_NAME does not resolve to the exact stable version $version" >&2
+              exit 1
+            fi
+          fi
+
+          if [[ ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Release version is not a stable SemVer value: $version" >&2
+            exit 1
+          fi
+
+          tag="v$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Release version: $version"
+
+  create-release:
+    needs: verify-and-calculate
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.verify-and-calculate.outputs.version }}
+      TAG: ${{ needs.verify-and-calculate.outputs.tag }}
+    steps:
+      - name: Create GitHub Release with generated notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; reusing it."
+          else
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "$TAG" \
+              --generate-notes \
+              --fail-on-no-commits
+          fi
+
+      - name: Dispatch Maven Central publishing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh workflow run release.yml
+          --repo "$GITHUB_REPOSITORY"
+          --ref main
+          --field release_tag="$TAG"
